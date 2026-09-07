@@ -123,17 +123,39 @@ jobs:
           tarball_url="https://github.com/${REPOSITORY}/archive/refs/tags/${TAG}.tar.gz"
           temp_tarball="$(mktemp)"
 
-          curl -fsSL "$tarball_url" -o "$temp_tarball"
+          attempt=1
+          max_attempts=10
+          until curl -fsSL "$tarball_url" -o "$temp_tarball"; do
+            if [[ "$attempt" -ge "$max_attempts" ]]; then
+              echo "Failed to download ${tarball_url} after ${max_attempts} attempts." >&2
+              exit 1
+            fi
+            sleep_seconds=$((attempt * 6))
+            echo "Tarball is not ready yet. Retry ${attempt}/${max_attempts} in ${sleep_seconds}s..."
+            sleep "$sleep_seconds"
+            attempt=$((attempt + 1))
+          done
+
           tarball_sha256="$(sha256sum "$temp_tarball" | awk '{print $1}')"
           rm -f "$temp_tarball"
+          export TARBALL_SHA256="$tarball_sha256"
 
-          cat > Formula/tokenusageinsights.rb <<EOF
+          python - <<'PY'
+          from pathlib import Path
+          import os
+          import textwrap
+
+          repository = os.environ["REPOSITORY"]
+          tarball_url = f"https://github.com/{repository}/archive/refs/tags/{os.environ['TAG']}.tar.gz"
+          tarball_sha256 = os.environ["TARBALL_SHA256"]
+
+          content = f"""
           class Tokenusageinsights < Formula
             desc "Local-first dashboard for AI coding agent token usage"
-            homepage "https://github.com/${REPOSITORY}"
+            homepage "https://github.com/{repository}"
             license "MIT"
-            url "${tarball_url}"
-            sha256 "${tarball_sha256}"
+            url "{tarball_url}"
+            sha256 "{tarball_sha256}"
 
             depends_on "rust" => :build
 
@@ -142,8 +164,8 @@ jobs:
 
               (bin/"tokenusageinsights").write <<~EOS
                 #!/bin/bash
-                cd \"#{pkgshare}\" || exit 1
-                exec \"#{libexec}/bin/token-usage-insights\" \"$@\"
+                cd "#{{pkgshare}}" || exit 1
+                exec "#{{libexec}}/bin/token-usage-insights" "$@"
               EOS
               chmod 0755, bin/"tokenusageinsights"
 
@@ -154,11 +176,14 @@ jobs:
             end
 
             test do
-              output = shell_output("#{bin}/token-usage-insights-cli --help")
+              output = shell_output("#{{bin}}/token-usage-insights-cli --help")
               assert_match "token-usage-insights-cli", output
             end
           end
-          EOF
+          """
+
+          Path("Formula/tokenusageinsights.rb").write_text(textwrap.dedent(content).lstrip(), encoding="utf-8")
+          PY
 
       - name: Commit and push formula update
         if: steps.detect.outputs.has_changes == 'true'
