@@ -1,0 +1,180 @@
+name: Daily Sync and Release
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: daily-sync-release
+  cancel-in-progress: false
+
+jobs:
+  sync-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Configure and fetch upstream
+        run: |
+          set -euo pipefail
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream https://github.com/doggy8088/TokenUsageInsights.git
+          git fetch upstream main --tags --prune
+          git fetch origin main --prune
+
+      - name: Detect upstream changes
+        id: detect
+        run: |
+          set -euo pipefail
+          git checkout main
+          git pull --ff-only origin main
+
+          upstream_new_commits="$(git rev-list --count HEAD..upstream/main)"
+          echo "upstream_new_commits=${upstream_new_commits}"
+
+          if [[ "${upstream_new_commits}" -eq 0 ]]; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "has_changes=true" >> "$GITHUB_OUTPUT"
+
+      - name: Sync upstream/main into local main
+        if: steps.detect.outputs.has_changes == 'true'
+        run: |
+          set -euo pipefail
+          if git merge --no-edit upstream/main; then
+            echo "Merge completed without conflicts."
+          else
+            echo "Merge conflicts detected. Keeping local automation files when conflicts occur."
+            protected_files=(
+              ".github/workflows/daily-sync-release.yml"
+              "Formula/tokenusageinsights.rb"
+              "README.md"
+            )
+
+            for file in "${protected_files[@]}"; do
+              if git ls-files --error-unmatch "$file" >/dev/null 2>&1 || [[ -e "$file" ]]; then
+                git checkout --ours -- "$file" || true
+                git add "$file" || true
+              fi
+            done
+
+            unresolved="$(git diff --name-only --diff-filter=U)"
+            if [[ -n "$unresolved" ]]; then
+              echo "Unresolved merge conflicts remain:" >&2
+              echo "$unresolved" >&2
+              exit 1
+            fi
+
+            git commit --no-edit
+          fi
+
+      - name: Push synchronized main
+        if: steps.detect.outputs.has_changes == 'true'
+        run: git push origin main
+
+      - name: Generate release tag
+        if: steps.detect.outputs.has_changes == 'true'
+        id: tag
+        run: |
+          set -euo pipefail
+          base_tag="v$(date -u +'%Y.%m.%d.%H%M')"
+          tag="$base_tag"
+          suffix=1
+
+          while git rev-parse -q --verify "refs/tags/${tag}" >/dev/null || git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; do
+            tag="${base_tag}.${suffix}"
+            suffix=$((suffix + 1))
+          done
+
+          git tag -a "$tag" -m "chore(release): ${tag}"
+          git push origin "$tag"
+
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        if: steps.detect.outputs.has_changes == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: Token 戰情室 ${{ steps.tag.outputs.tag }}
+          generate_release_notes: true
+
+      - name: Update Homebrew formula for new tag
+        if: steps.detect.outputs.has_changes == 'true'
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tarball_url="https://github.com/${REPOSITORY}/archive/refs/tags/${TAG}.tar.gz"
+          temp_tarball="$(mktemp)"
+
+          curl -fsSL "$tarball_url" -o "$temp_tarball"
+          tarball_sha256="$(sha256sum "$temp_tarball" | awk '{print $1}')"
+          rm -f "$temp_tarball"
+
+          cat > Formula/tokenusageinsights.rb <<EOF
+          class Tokenusageinsights < Formula
+            desc "Local-first dashboard for AI coding agent token usage"
+            homepage "https://github.com/${REPOSITORY}"
+            license "MIT"
+            url "${tarball_url}"
+            sha256 "${tarball_sha256}"
+
+            depends_on "rust" => :build
+
+            def install
+              system "cargo", "install", *std_cargo_args(path: ".", root: libexec)
+
+              (bin/"tokenusageinsights").write <<~EOS
+                #!/bin/bash
+                cd \"#{pkgshare}\" || exit 1
+                exec \"#{libexec}/bin/token-usage-insights\" \"$@\"
+              EOS
+              chmod 0755, bin/"tokenusageinsights"
+
+              bin.install_symlink bin/"tokenusageinsights" => "token-usage-insights"
+              bin.install libexec/"bin/token-usage-insights-cli"
+
+              pkgshare.install "static", "pricing.csv", "shell", "scripts", "README.md", "LICENSE"
+            end
+
+            test do
+              output = shell_output("#{bin}/token-usage-insights-cli --help")
+              assert_match "token-usage-insights-cli", output
+            end
+          end
+          EOF
+
+      - name: Commit and push formula update
+        if: steps.detect.outputs.has_changes == 'true'
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git add Formula/tokenusageinsights.rb
+          if git diff --cached --quiet; then
+            echo "Formula is already up-to-date."
+            exit 0
+          fi
+
+          git commit -m "chore(brew): update formula for ${TAG} [skip daily-sync-release]"
+          git push origin main
+
+      - name: No upstream changes
+        if: steps.detect.outputs.has_changes != 'true'
+        run: echo "No upstream changes detected; skipping sync, tag, release, and formula update."
