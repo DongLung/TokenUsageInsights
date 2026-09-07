@@ -638,6 +638,12 @@ brew install tokenusageinsights
 brew upgrade tokenusageinsights
 ```
 
+安裝後可直接執行：
+
+```bash
+tokenusageinsights
+```
+
 此外，`.github/workflows/daily-sync-release.yml` 會每天自動同步上游 `doggy8088/TokenUsageInsights`：
 
 - 若偵測到 `upstream/main` 有新變更，workflow 會自動同步到本 repo `main`、建立 UTC 版本 tag（`vYYYY.MM.DD.HHMM`）與 GitHub Release。
